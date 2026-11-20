@@ -1,28 +1,52 @@
+import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
+import 'dart:typed_data';
 import 'package:camera/camera.dart';
-import 'package:flutter/material.dart';
-import 'package:get/get.dart' as getx;
-// ignore: unused_import
-import 'package:image/image.dart' as img;
+import 'package:flutter/widgets.dart';
+import 'package:get/get.dart';
 import 'package:rxdart/rxdart.dart' as rx;
 import '../../isolates/frame_processor.dart';
-import 'dart:typed_data';
-import 'dart:isolate';
 
-class StreamingController extends getx.GetxController with WidgetsBindingObserver {
-  getx.Rx<CameraController?> cameraController = getx.Rx<CameraController?>(
-    null,
-  );
-  getx.RxBool isInitialized = false.obs;
-  getx.RxBool isStreaming = false.obs;
+enum StreamConnectionState {
+  idle,
+  initializingCamera,
+  connectingServer,
+  streaming,
+  error,
+}
 
-  late rx.PublishSubject<CameraImage> _frameSubject;
+class StreamingController extends GetxController with WidgetsBindingObserver {
+  final Rx<CameraController?> cameraController = Rx<CameraController?>(null);
+  final RxBool isInitialized = false.obs;
+  final RxBool isStreaming = false.obs;
+
+  final Rx<StreamConnectionState> connectionState =
+      StreamConnectionState.idle.obs;
+  final RxString errorMessage = ''.obs;
+
+  // Configurable from Settings page later
+  final RxString serverUrl = _defaultServerUrl().obs;
+  final RxInt connectionTimeoutSeconds = 5.obs;
+
+  rx.PublishSubject<CameraImage>? _frameSubject;
+  StreamSubscription<CameraImage>? _throttledSub;
   Isolate? _processingIsolate;
   SendPort? _isolateSendPort;
   ReceivePort? _mainReceivePort;
-
   WebSocket? _webSocket;
-  final String _wsUrl = 'ws://10.0.2.2:8000/ws';
+
+  bool _isStarting = false;
+  bool _cancelRequested = false;
+  int _nextFrameId = 0;
+  int _lastSentFrameId = -1;
+
+  static String _defaultServerUrl() {
+    if (Platform.isAndroid) {
+      return 'ws://10.0.2.2:8000/ws';
+    }
+    return 'ws://127.0.0.1:8000/ws';
+  }
 
   @override
   void onInit() {
@@ -32,59 +56,40 @@ class StreamingController extends getx.GetxController with WidgetsBindingObserve
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    final camera = cameraController.value;
-
-    if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
-      if (isStreaming.value) {
-        stopStreaming();
-      }
-
-      if (camera != null && camera.value.isInitialized) {
-        camera.dispose();
-        cameraController.value = null;
-        isInitialized.value = false;
-      }
-    }
-
-    else if (state == AppLifecycleState.resumed) {
-      _initCamera();
+    if ((Platform.isAndroid || Platform.isIOS) &&
+        (state == AppLifecycleState.paused ||
+            state == AppLifecycleState.inactive)) {
+      _teardownAll();
     }
   }
 
-
-  @override
-  void onClose() {
-    WidgetsBinding.instance.removeObserver(this);
-    stopStreaming();
-    cameraController.value?.dispose();
-    super.onClose();
-  }
-  
   Future<void> _initCamera() async {
-    if (cameraController.value != null) return; // Already initialized
+    if (cameraController.value != null &&
+        cameraController.value!.value.isInitialized) {
+      return;
+    }
+
     final cameras = await availableCameras();
-    if (cameras.isEmpty) return;
+    if (cameras.isEmpty) {
+      throw Exception('Камеру не знайдено на цьому пристрої');
+    }
+
     final camera = CameraController(
-      cameras[0],
+      cameras.first,
       ResolutionPreset.medium,
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
+
     cameraController.value = camera;
     try {
       await camera.initialize();
       isInitialized.value = true;
     } catch (e) {
-      print('Error initializing camera: $e');
-    }
-  }
-
-  Future<void> _connectWebSocket() async {
-    try {
-      _webSocket = await WebSocket.connect(_wsUrl);
-      print('WebSocket connected to $_wsUrl');
-    } catch (e) {
-      print('WebSocket connection error: $e');
+      await camera.dispose();
+      cameraController.value = null;
+      isInitialized.value = false;
+      rethrow;
     }
   }
 
@@ -98,131 +103,206 @@ class StreamingController extends getx.GetxController with WidgetsBindingObserve
     _mainReceivePort!.listen((dynamic message) {
       if (message is SendPort) {
         _isolateSendPort = message;
-        // print('Isolate SendPort received');
-      } else if (message is Uint8List) {
+      } else if (message is Map && message.containsKey('jpeg')) {
+        final int frameId = message['frameId'] as int;
+        if (frameId < _lastSentFrameId) return;
+        _lastSentFrameId = frameId;
+
+        final Uint8List jpegBytes = (message['jpeg'] as TransferableTypedData)
+            .materialize()
+            .asUint8List();
 
         if (_webSocket != null && _webSocket!.readyState == WebSocket.open) {
-          _webSocket!.add(message);
+          _webSocket!.add(jpegBytes);
         }
-
-
-        // HEAVY DEBUG BLOCK TO CHECK IF FRAMES ARE RECIEVED CORRECTLY
-
-        // final processedImage = img.decodeJpg(message);
-        // if (processedImage != null) {
-
-        //   print(
-        //     'Processed frame JPEG dimensions: ${processedImage.width}x${processedImage.height}',
-        //   );
-        // }
-        // print(
-        //   'Processed frame received from isolate, JPEG size: ${message.length}',
-        // );
-
-
       } else if (message is Map && message['error'] != null) {
-        print('Frame processing error: ${message['error']}');
-      } else {
-        print('Unknown message from isolate: $message');
+        debugPrint('Frame processing error: ${message['error']}');
       }
     });
   }
 
-  Future<void> startStreaming() async {
-    if (isStreaming.value) return;
+  Future<void> _connectWebSocket() async {
+    final timeout = Duration(seconds: connectionTimeoutSeconds.value);
+    _webSocket = await WebSocket.connect(serverUrl.value).timeout(timeout);
 
-    await _initCamera();
-    await _startIsolate();
-    await _connectWebSocket();
-
-    if (cameraController.value == null || !cameraController.value!.value.isInitialized) {
-      print("Streaming aborted: Camera was disposed during startup sequence.");
-      return;
-    }
-
-    // Recreate frame subject every start
-    _frameSubject = rx.PublishSubject<CameraImage>();
-
-    // Start camera image stream
-    if (cameraController.value != null &&
-        cameraController.value!.value.isInitialized) {
-      await cameraController.value!.startImageStream((CameraImage image) {
-        _frameSubject.add(image);
-      });
-
-      _frameSubject.throttleTime(const Duration(milliseconds: 66)).listen((
-        CameraImage image,
-      ) {
-        print('Throttled frame: ${image.width}x${image.height}');
-        if (_isolateSendPort != null) {
-          final bytes = Uint8List.fromList(
-            image.planes.expand((p) => p.bytes).toList(),
-          );
-          _isolateSendPort!.send({
-            'bytes': bytes,
-            'width': image.width,
-            'height': image.height,
-            'format': image.format.group.index,
-          });
-          // print('Frame sent to isolate');
-        } else {
-          print('Isolate SendPort is null, frame not sent');
-        }
-      });
-
-      isStreaming.value = true;
-      print('Streaming started');
-    }
+    _webSocket!.listen(
+      (dynamic serverMessage) {
+        debugPrint('Server feedback: $serverMessage');
+      },
+      onError: (error) => debugPrint('WebSocket stream error: $error'),
+      onDone: () => debugPrint('WebSocket closed by server'),
+    );
   }
 
-  Future<void> stopStreaming() async {
-    if (cameraController.value != null &&
-        cameraController.value!.value.isStreamingImages) {
+  Future<void> startStreaming({bool requireServer = true}) async {
+      if (isStreaming.value || _isStarting) return;
+      _isStarting = true;
+      _cancelRequested = false;
+      _nextFrameId = 0;
+      _lastSentFrameId = -1;
+      errorMessage.value = '';
+
       try {
-        await cameraController.value!.stopImageStream();
-        print('Streaming stopped');
+        connectionState.value = StreamConnectionState.initializingCamera;
+        try {
+          await _initCamera();
+        } catch (e) {
+          debugPrint('Camera initialization error: $e');
+          if (!_cancelRequested) {
+            errorMessage.value =
+                'Не вдалося запустити камеру. Перевірте пристрій та дозволи.';
+            connectionState.value = StreamConnectionState.error;
+          }
+          return;
+        }
+        if (_aborted) return;
+
+        await _startIsolate();
+        if (_aborted) return;
+
+        if (requireServer) {
+          connectionState.value = StreamConnectionState.connectingServer;
+          await _connectWebSocket();
+          if (_aborted) return;
+        }
+
+        _frameSubject = rx.PublishSubject<CameraImage>();
+        _throttledSub = _frameSubject!
+            .throttleTime(const Duration(milliseconds: 66))
+            .listen(_dispatchFrameToIsolate);
+
+        await cameraController.value!.startImageStream((CameraImage image) {
+          if (_frameSubject != null && !_frameSubject!.isClosed) {
+            _frameSubject!.add(image);
+          }
+        });
+
+        isStreaming.value = true;
+        connectionState.value = StreamConnectionState.streaming;
+      } on TimeoutException catch (e) {
+        debugPrint('WebSocket connection timeout: $e');
+        await stopStreaming(resetState: false);
+        errorMessage.value =
+            'Час очікування відповіді від сервера вичерпано. Перевірте з\'єднання.';
+        connectionState.value = StreamConnectionState.error;
       } catch (e) {
-        print('Error stopping image stream: $e');
+        debugPrint('WebSocket connection error: $e');
+        await stopStreaming(resetState: false);
+        if (!_cancelRequested) {
+          errorMessage.value =
+              'Помилка підключення до сервера. Перевірте з\'єднання.';
+          connectionState.value = StreamConnectionState.error;
+        }
+      } finally {
+        _isStarting = false;
       }
     }
 
-    // Close frame subject safely
-    try {
-      if (!_frameSubject.isClosed) {
-        await _frameSubject.close();
-      }
-    } catch (e) {
-      print('Error closing frame subject: $e');
+  bool get _aborted =>
+      _cancelRequested ||
+      isClosed ||
+      cameraController.value == null ||
+      !cameraController.value!.value.isInitialized;
+
+  Future<void> cancelConnecting() async {
+    _cancelRequested = true;
+    await stopStreaming();
+  }
+
+  void _dispatchFrameToIsolate(CameraImage image) {
+    final sendPort = _isolateSendPort;
+    if (sendPort == null) return;
+
+    final int planeCount = image.planes.length;
+    int totalBytes = 0;
+    final List<int> planeLengths = List<int>.filled(planeCount, 0);
+    final List<int> rowStrides = List<int>.filled(planeCount, 0);
+
+    for (int i = 0; i < planeCount; i++) {
+      final plane = image.planes[i];
+      planeLengths[i] = plane.bytes.length;
+      rowStrides[i] = plane.bytesPerRow;
+      totalBytes += plane.bytes.length;
     }
 
-    // Close the WebSocket safely 
+    final Uint8List packedBytes = Uint8List(totalBytes);
+    int offset = 0;
+    for (int i = 0; i < planeCount; i++) {
+      final Uint8List src = image.planes[i].bytes;
+      packedBytes.setRange(offset, offset + src.length, src);
+      offset += src.length;
+    }
+
+    final int uvPixelStride =
+        planeCount > 1 ? (image.planes[1].bytesPerPixel ?? 1) : 1;
+
+    sendPort.send({
+      'frameId': _nextFrameId++,
+      'data': TransferableTypedData.fromList([packedBytes]),
+      'width': image.width,
+      'height': image.height,
+      'format': image.format.group.index,
+      'formatRaw': image.format.raw?.toString() ?? '',
+      'planeLengths': planeLengths,
+      'rowStrides': rowStrides,
+      'uvPixelStride': uvPixelStride,
+    });
+  }
+
+  Future<void> stopStreaming({bool resetState = true}) async {
+    final controller = cameraController.value;
+    if (controller != null &&
+        controller.value.isInitialized &&
+        controller.value.isStreamingImages) {
+      try {
+        await controller.stopImageStream();
+      } catch (e) {
+        debugPrint('Error stopping image stream: $e');
+      }
+    }
+
+    await _throttledSub?.cancel();
+    _throttledSub = null;
+
+    if (_frameSubject != null && !_frameSubject!.isClosed) {
+      await _frameSubject!.close();
+    }
+    _frameSubject = null;
 
     try {
       await _webSocket?.close();
-      _webSocket = null;
-      print('WebSocket closed');
     } catch (e) {
-      print('Error closing WebSocket: $e');
+      debugPrint('Error closing WebSocket: $e');
+    } finally {
+      _webSocket = null;
     }
 
-    // Kill processing isolate
-    try {
-      _processingIsolate?.kill(priority: Isolate.immediate);
-    } catch (e) {
-      print('Error killing isolate: $e');
-    } finally {
-      _processingIsolate = null;
-      _isolateSendPort = null;
-      try {
-        _mainReceivePort?.close();
-      } catch (e) {
-        print('Error closing receive port: $e');
-      } finally {
-        _mainReceivePort = null;
-      }
-    }
+    _processingIsolate?.kill(priority: Isolate.immediate);
+    _processingIsolate = null;
+    _isolateSendPort = null;
+
+    _mainReceivePort?.close();
+    _mainReceivePort = null;
 
     isStreaming.value = false;
+    if (resetState) {
+      connectionState.value = StreamConnectionState.idle;
+      errorMessage.value = '';
+    }
   }
 
+  Future<void> _teardownAll() async {
+    await stopStreaming();
+    final controller = cameraController.value;
+    cameraController.value = null;
+    isInitialized.value = false;
+    await controller?.dispose();
+  }
+
+  @override
+  void onClose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _teardownAll();
+    super.onClose();
+  }
 }
