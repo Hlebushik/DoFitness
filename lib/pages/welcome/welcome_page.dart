@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
-import 'package:online_trainer/pages/login/login_page.dart';
+import 'package:get/get.dart';
 import 'package:lottie/lottie.dart';
+import '../login/login_page.dart';
 
 class WelcomePage extends StatelessWidget {
   const WelcomePage({super.key});
@@ -8,60 +9,59 @@ class WelcomePage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Center(
-        child: SingleChildScrollView(
-          child: Padding(
-            padding: const EdgeInsets.all(20.0),
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 16.0),
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                Lottie.asset(
-                  'assets/lotties/welcome_screen.json',
-                  height: 400.0,
-                ),
-                FittedBox(
-                  child: Text(
-                    'Do Fitness Online',
-                    style: TextStyle(
-                      fontSize: 40.0,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 10.0,
-                    ),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(
+                    maxWidth: 380,
+                    maxHeight: 380,
+                  ),
+                  child: Lottie.asset(
+                    'assets/lotties/welcome_screen.json',
+                    fit: BoxFit.contain,
                   ),
                 ),
-                SizedBox(height: 30),
-                FilledButton(
-                  onPressed: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) {
-                          return LoginPage(title: 'Вхід');
-                        },
+                const SizedBox(height: 24),
+                Text(
+                  'Do Fitness Online',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 4.0,
                       ),
-                    );
-                  },
-                  style: FilledButton.styleFrom(
-                    minimumSize: Size(double.infinity, 50),
-                  ),
-                  child: Text('Вхід', style: TextStyle(fontSize: 16)),
                 ),
-                SizedBox(height: 20),
-                TextButton(
-                  onPressed: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) {
-                          return LoginPage(title: 'Реєстрація');
-                        },
+                const SizedBox(height: 32),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 360),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      FilledButton(
+                        onPressed: () => Get.to(() => const LoginPage()),
+                        style: FilledButton.styleFrom(
+                          minimumSize: const Size(double.infinity, 48),
+                          shape: const StadiumBorder(),
+                        ),
+                        child: Text('login'.tr),
                       ),
-                    );
-                  },
-                  style: FilledButton.styleFrom(
-                    minimumSize: Size(double.infinity, 50),
+                      const SizedBox(height: 12),
+                      TextButton(
+                        onPressed: () => Get.to(
+                          () => const LoginPage(),
+                        ),
+                        style: TextButton.styleFrom(
+                          minimumSize: const Size(double.infinity, 44),
+                          shape: const StadiumBorder(),
+                        ),
+                        child: Text('register'.tr),
+                      ),
+                    ],
                   ),
-                  child: Text('Зареєструватися', style: TextStyle(fontSize: 16)),
                 ),
               ],
             ),
